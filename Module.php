@@ -3,104 +3,77 @@
 namespace filsh\yii2\oauth2server;
 
 use \Yii;
-use yii\i18n\PhpMessageSource;
-use  \array_key_exists;
 
 /**
  * For example,
- * 
+ *
  * ```php
  * 'oauth2' => [
  *     'class' => 'filsh\yii2\oauth2server\Module',
- *     'tokenParamName' => 'accessToken',
- *     'tokenAccessLifetime' => 3600 * 24,
+ *     'options' => [
+ *         'token_param_name' => 'accessToken',
+ *         'access_lifetime' => 3600
+ *     ],
  *     'storageMap' => [
- *         'user_credentials' => 'common\models\User',
+ *         'user_credentials' => 'common\models\User'
  *     ],
  *     'grantTypes' => [
+ *         'client_credentials' => [
+ *             'class' => '\OAuth2\GrantType\ClientCredentials',
+ *             'allow_public_clients' => false
+ *         ],
  *         'user_credentials' => [
- *             'class' => 'OAuth2\GrantType\UserCredentials',
+ *             'class' => '\OAuth2\GrantType\UserCredentials'
  *         ],
  *         'refresh_token' => [
- *             'class' => 'OAuth2\GrantType\RefreshToken',
+ *             'class' => '\OAuth2\GrantType\RefreshToken',
  *             'always_issue_new_refresh_token' => true
  *         ]
- *     ]
+ *     ],
  * ]
  * ```
  */
 class Module extends \yii\base\Module
 {
-    const VERSION = '2.0.0';
-    
-    /**
-     * @var array Model's map
-     */
-    public $modelMap = [];
-    
-    /**
-     * @var array Storage's map
-     */
+    public $options = [];
+
     public $storageMap = [];
-    
-    /**
-     * @var array GrantTypes collection
-     */
+
+    public $storageDefault = 'filsh\yii2\oauth2server\storage\Pdo';
+
     public $grantTypes = [];
-    
-    /**
-     * @var string name of access token parameter
-     */
-    public $tokenParamName;
-    
-    /**
-     * @var type max access lifetime
-     */
-    public $tokenAccessLifetime;
-    /**
-     * @var whether to use JWT tokens
-     */
-    public $useJwtToken = false;//ADDED
-    
+
+    public $modelClasses = [];
+
+    public $i18n;
+
+    private $_server;
+
+    private $_request;
+
+    private $_models = [];
+
     /**
      * @inheritdoc
      */
     public function init()
     {
         parent::init();
+        $this->modelClasses = array_merge($this->getDefaultModelClasses(), $this->modelClasses);
         $this->registerTranslations();
     }
-    
-    /**
-     * Gets Oauth2 Server
-     * 
-     * @return \filsh\yii2\oauth2server\Server
-     * @throws \yii\base\InvalidConfigException
-     */
-    public function getServer()
-    {
-        if(!$this->has('server')) {
-            $storages = [];
-            
-            if($this->useJwtToken)
-            {
-                if(!array_key_exists('access_token', $this->storageMap) || !array_key_exists('public_key', $this->storageMap)) {
-                        throw new \yii\base\InvalidConfigException('access_token and public_key must be set or set useJwtToken to false');
-                }
-                //define dependencies when JWT is used instead of normal token
-                \Yii::$container->clear('public_key'); //remove old definition
-                \Yii::$container->set('public_key', $this->storageMap['public_key']);
-                \Yii::$container->set('OAuth2\Storage\PublicKeyInterface', $this->storageMap['public_key']);
 
-                \Yii::$container->clear('access_token'); //remove old definition
-                \Yii::$container->set('access_token', $this->storageMap['access_token']);
-            }
-            
-            foreach(array_keys($this->storageMap) as $name) {
-                $storages[$name] = \Yii::$container->get($name);
-            }
-            
-            $grantTypes = [];
+    /**
+     * Get oauth2 server instance
+     * @param type $force
+     * @return \OAuth2\Server
+     */
+    public function getServer($force = false)
+    {
+        if($this->_server === null || $force === true) {
+            $storages = $this->createStorages();
+            $server = new \OAuth2\Server($storages, $this->options);
+
             foreach($this->grantTypes as $name => $options) {
                 if(!isset($storages[$name]) || empty($options['class'])) {
                     throw new \yii\base\InvalidConfigException('Invalid grant types configuration.');
@@ -113,68 +86,114 @@ class Module extends \yii\base\Module
                 $config = array_merge([0 => $storages[$name]], [$options]);
 
                 $instance = $reflection->newInstanceArgs($config);
-                $grantTypes[$name] = $instance;
+                $server->addGrantType($instance);
             }
-            
-            $server = \Yii::$container->get(Server::className(), [
-                $this,
-                $storages,
-                [
-                    'use_jwt_access_tokens' => $this->useJwtToken,//ADDED
-                    'token_param_name' => $this->tokenParamName,
-                    'access_lifetime' => $this->tokenAccessLifetime,
-                    /** add more ... */
-                ],
-                $grantTypes
-            ]);
 
-            $this->set('server', $server);
+            $this->_server = $server;
         }
-        return $this->get('server');
+        return $this->_server;
     }
-    
-    public function getRequest()
+
+    /**
+     * Get oauth2 request instance from global variables
+     * @return \OAuth2\Request
+     */
+    public function getRequest($force = false)
     {
-        if(!$this->has('request')) {
-            $this->set('request', Request::createFromGlobals());
-        }
-        return $this->get('request');
+        if ($this->_request === null || $force) {
+            $this->_request = \OAuth2\Request::createFromGlobals();
+        };
+        return $this->_request;
     }
-    
+
+    /**
+     * Get oauth2 response instance
+     * @return \OAuth2\Response
+     */
     public function getResponse()
     {
-        if(!$this->has('response')) {
-            $this->set('response', new Response());
+        return new \OAuth2\Response();
+    }
+
+    /**
+     * Create storages
+     * @return type
+     */
+    public function createStorages()
+    {
+        $connection = Yii::$app->getDb();
+        if(!$connection->getIsActive()) {
+            $connection->open();
         }
-        return $this->get('response');
+
+        $storages = [];
+        foreach($this->storageMap as $name => $storage) {
+            $storages[$name] = Yii::createObject($storage);
+        }
+
+        $defaults = [
+            'access_token',
+            'authorization_code',
+            'client_credentials',
+            'client',
+            'refresh_token',
+            'user_credentials',
+            'public_key',
+            'jwt_bearer',
+            'scope',
+        ];
+        foreach($defaults as $name) {
+            if(!isset($storages[$name])) {
+                $storages[$name] = Yii::createObject($this->storageDefault);
+            }
+        }
+
+        return $storages;
+    }
+
+    /**
+     * Get object instance of model
+     * @param string $name
+     * @param array $config
+     * @return ActiveRecord
+     */
+    public function model($name, $config = [])
+    {
+        if(!isset($this->_models[$name])) {
+            $className = $this->modelClasses[ucfirst($name)];
+            $this->_models[$name] = Yii::createObject(array_merge(['class' => $className], $config));
+        }
+        return $this->_models[$name];
     }
 
     /**
      * Register translations for this module
-     * 
      * @return array
      */
     public function registerTranslations()
     {
-        if(!isset(Yii::$app->get('i18n')->translations['modules/oauth2/*'])) {
-            Yii::$app->get('i18n')->translations['modules/oauth2/*'] = [
-                'class'    => PhpMessageSource::className(),
-                'basePath' => __DIR__ . '/messages',
+        Yii::setAlias('@oauth2server', dirname(__FILE__));
+        if (empty($this->i18n)) {
+            $this->i18n = [
+                'class' => 'yii\i18n\PhpMessageSource',
+                'basePath' => '@oauth2server/messages',
             ];
         }
+        Yii::$app->i18n->translations['oauth2server'] = $this->i18n;
     }
-    
+
     /**
-     * Translate module message
-     * 
-     * @param string $category
-     * @param string $message
-     * @param array $params
-     * @param string $language
-     * @return string
+     * Get default model classes
+     * @return array
      */
-    public static function t($category, $message, $params = [], $language = null)
+    protected function getDefaultModelClasses()
     {
-        return Yii::t('modules/oauth2/' . $category, $message, $params, $language);
+        return [
+            'Clients' => 'filsh\yii2\oauth2server\models\OauthClients',
+            'AccessTokens' => 'filsh\yii2\oauth2server\models\OauthAccessTokens',
+            'AuthorizationCodes' => 'filsh\yii2\oauth2server\models\OauthAuthorizationCodes',
+            'RefreshTokens' => 'filsh\yii2\oauth2server\models\OauthRefreshTokens',
+            'Scopes' => 'filsh\yii2\oauth2server\models\OauthScopes',
+        ];
     }
 }
